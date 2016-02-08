@@ -7,6 +7,7 @@ import json
 import pycurl
 import re
 
+import util
 import cherrypy
 
 DB_STRING = "pref.db"
@@ -14,6 +15,7 @@ SERVER_KEY = "AIzaSyAhL2EX96bgmKQSgvwKCrCZjTAwsGzrHNM"
 MIN_PASSWORD_LENGTH = 5
 MIN_NAME_LENGTH = 3
 START_COINS = 100
+
 
 class StringGeneratorWebService(object):
     exposed = True
@@ -55,16 +57,31 @@ def send_data(reg_ids, message_data):
 
 
 def process_request(**kwargs):
-    globals()['on_'+kwargs['request']+'_request'](**kwargs)
+    globals()['on_' + kwargs['request'] + '_request'](**kwargs)
 
 
 def process_notification(**kwargs):
-    globals()['on_'+kwargs['notification']+'_notification'](**kwargs)
+    globals()['on_' + kwargs['notification'] + '_notification'](**kwargs)
 
 
 def on_keep_alive_notification(**kwargs):
     message = time.time()
-    send_message(kwargs['reg_id'], message, 'KEEP_ALIVE', 0)
+    try:
+        reg_id = kwargs['reg_id'] if 'reg_id' in kwargs.keys() else \
+            get_player_row(kwargs['id'], kwargs['password'])['reg_id']
+        send_message(reg_id, message, 'KEEP_ALIVE', 0)
+    except Exception as e:
+        print(e)
+
+
+def get_player_row(id, password):
+    with sqlite3.connect(DB_STRING) as con:
+        con.row_factory = sqlite3.Row
+        result = con.execute("SELECT * FROM players WHERE id=? AND password=?",
+                             (id, password))
+        if result.rowcount == 0:
+            return None
+        return result.fetchone()
 
 
 def on_register_request(**kwargs):
@@ -75,6 +92,8 @@ def on_register_request(**kwargs):
     if not re.match('^[a-zA-Z][a-zA-Z_0-9]*$', name):
         send_message(kwargs['reg_id'], "Name should start with latin letter",
                      'ENTRY_ACTIVITY', 'ENTRY_REGISTRATION_RESULT')
+        return
+
     if len(name) < 3:
         send_message(kwargs['reg_id'], "Name should be at least 3 characters long",
                      'ENTRY_ACTIVITY', 'ENTRY_REGISTRATION_RESULT')
@@ -87,17 +106,41 @@ def on_register_request(**kwargs):
         return
 
     with sqlite3.connect(DB_STRING) as con:
-        result = con.execute("SELECT * FROM players WHERE name=?", (name, ))
+        result = con.execute("SELECT * FROM players")
+        print("There are {} players".format(result.rowcount))
+        result = con.execute("SELECT * FROM players WHERE name=?", (name,))
         if result.rowcount > 0:
             send_message(kwargs['reg_id'], "Name already exists",
                          'ENTRY_ACTIVITY', 'ENTRY_REGISTRATION_RESULT')
             return
-        con.execute("INSERT INTO players (name, password, coins, online, reg_id) VALUES(?, ?, ?, ?, ?)",
-                    (name, password, START_COINS, True, reg_id))
-        data = '{} {} {}'.format(con.lastrowid,  name, password)
+        cursor = con.execute("INSERT INTO players (name, password, coins, online, reg_id) VALUES(?, ?, ?, ?, ?)",
+                             (name, password, START_COINS, True, reg_id))
+        data = '{} {} {}'.format(cursor.lastrowid, name, password)
         send_message(reg_id, data, 'ENTRY_ACTIVITY', 'ENTRY_REGISTRATION_RESULT')
 
         cherrypy.log("Registered player with name={} and password={}".format(name, password))
+
+
+def on_ping_request(**kwargs):
+    send_message(kwargs['reg_id'], "", 'PING_ANSWER', 'KEEP_ALIVE_ANSWER')
+
+
+def on_signin_request(**kwargs):
+    with sqlite3.connect(DB_STRING) as con:
+        con.row_factory = sqlite3.Row
+        result = con.execute("SELECT * FROM players WHERE name=? AND password=?",
+                             (kwargs['login'], kwargs['password']))
+        data = '{} {} {}'.format(result.fetchone()['id'], kwargs['login'], kwargs['password'])
+        if result.rowcount == 1:
+            send_message(kwargs['reg_id'], data,
+                         'ENTRY_ACTIVITY', 'ENTRY_LOGIN_RESULT')
+        else:
+            send_message(kwargs['reg_id'], "User not found!",
+                         'ENTRY_ACTIVITY', 'ENTRY_LOGIN_RESULT')
+
+
+def on_quit_notification(**kwargs):
+    pass
 
 
 def send_message(reg_ids, message, receiver, msg_type):
@@ -110,7 +153,7 @@ def send_message(reg_ids, message, receiver, msg_type):
 def setup_database():
     players_table_sql = "CREATE TABLE if NOT EXISTS players (id INTEGER PRIMARY KEY ASC, " \
                         "name VARCHAR(40), password VARCHAR(40), coins UNSIGNED INTEGER," \
-                        "room_id INTEGER, own_number INTEGER, online INTEGER," \
+                        "room_id INTEGER, reg_id TEXT, own_number INTEGER, online INTEGER," \
                         " FOREIGN KEY(room_id) REFERENCES rooms(id))"
     rooms_table_sql = "CREATE TABLE if NOT EXISTS rooms (id INTEGER PRIMARY KEY ASC, " \
                       "name VARCHAR(40), password VARCHAR(40), game_cost INTEGER, " \
@@ -130,6 +173,6 @@ if __name__ == '__main__':
         }
     }
 
-    cherrypy.server.socket_host = '0.0.0.0' # local computer, public available
+    cherrypy.server.socket_host = '0.0.0.0'  # local computer, public available
     cherrypy.engine.subscribe('start', setup_database)
     cherrypy.quickstart(StringGeneratorWebService(), '/', conf)
