@@ -4,18 +4,17 @@ import sqlite3
 import string
 import time
 import json
-import pycurl
+
 import re
 
-import util
+from util import send_message, id_to_regid, MyEncoder
 import cherrypy
+import party
 
 DB_STRING = "pref.db"
-SERVER_KEY = "AIzaSyAhL2EX96bgmKQSgvwKCrCZjTAwsGzrHNM"
 MIN_PASSWORD_LENGTH = 5
 MIN_NAME_LENGTH = 3
 START_COINS = 100
-
 
 class StringGeneratorWebService(object):
     exposed = True
@@ -68,27 +67,8 @@ class RoomInfo:
         self.noWhistRaspasyExit = True if row['no_whist_raspasy_exit'] == 1 else False
         self.stalingrad = True if row['stalingrad'] == 1 else False
         self.tenWhist = True if row['ten_whist'] == 1 else False
-        self.hasPassword = True if len(row['password']) > 0 else False
+        self.hasPassword = row['password'] != None
         self.playersNumber = players_number
-
-
-class MyEncoder(json.JSONEncoder):
-    def default(self, o):
-        return o.__dict__
-
-
-def send_data(reg_ids, message_data):
-    encoder = MyEncoder()
-    headers = ["Content-Type:application/json", "Authorization:key=" + SERVER_KEY]
-    data = {'data': message_data, 'registration_ids': reg_ids}
-    c = pycurl.Curl()
-    c.setopt(pycurl.URL, "https://android.googleapis.com/gcm/send")
-    c.setopt(pycurl.POST, True)
-    c.setopt(pycurl.HTTPHEADER, headers)
-    c.setopt(pycurl.POSTFIELDS, encoder.encode(data))
-    c.perform()
-
-    c.close()
 
 
 def process_request(**kwargs):
@@ -97,6 +77,33 @@ def process_request(**kwargs):
 
 def process_notification(**kwargs):
     globals()['on_' + kwargs['notification'] + '_notification'](**kwargs)
+
+def find_player_number_in_room(player_id, room_row):
+    for i in range(1,4):
+        if room_row['player{}'.format(i)] == player_id:
+            return i
+    return -1
+
+def on_user_exited_notification(**kwargs):
+    if not authentificate_user(**kwargs):
+        return
+    with sqlite3.connect(DB_STRING) as con:
+        con.row_factory = sqlite3.Row
+        result = con.execute("SELECT * FROM rooms WHERE id=?",
+                             (kwargs['room_id'], ))
+        if result.rowcount == 0:
+            return
+
+        row = result.fetchone()
+        num = find_player_number_in_room(kwargs['id'], row)
+        if num == -1:
+            return
+
+        #TODO if user just occasionally exited, we shouldn't shut down him... probably?
+        con.execute("UPDATE rooms SET player{}=? WHERE id=?".format(num),
+                        (None, kwargs['room_id']))
+        con.execute("UPDATE players SET room_id=? WHERE id=?",
+                        (None, kwargs['id']))
 
 
 def on_keep_alive_notification(**kwargs):
@@ -264,8 +271,10 @@ def on_connect_to_existing_request(**kwargs):
                                          (kwargs['room_id'], i, kwargs['id']))
                     result = '{} {} {}'.format(0, kwargs['room_id'], i)
                     break
+                print(row['player{}'.format(i)])
             else:
-                 result = '{} {} {}'.format(1, 0, 0)
+                print('HERE')
+                result = '{} {} {}'.format(1, 0, 0)
 
         print(result)
         send_message(id_to_regid[kwargs['id']], result, 'ROOMS_ACTIVITY', 'ROOMS_CONNECTION_RESULT')
@@ -300,28 +309,37 @@ def on_all_data_about_room_request(**kwargs):
         send_message(id_to_regid[kwargs['id']], data, 'GAME_ACTIVITY', 'GAME_ROOM_INFO')
 
 
-
-def send_message(reg_ids, message, receiver, msg_type):
-    if not type(reg_ids) is list:
-        reg_ids = [reg_ids]
-    message_data = {'message': message, 'receiver': receiver, "messageType": msg_type}
-    send_data(reg_ids, message_data)
-
-
 def setup_database():
     players_table_sql = "CREATE TABLE if NOT EXISTS players (id INTEGER PRIMARY KEY ASC, " \
                         "name VARCHAR(40), password VARCHAR(40), coins UNSIGNED INTEGER," \
                         "room_id INTEGER, reg_id TEXT, own_number INTEGER, online INTEGER, " \
-                        "time_left INTEGER, FOREIGN KEY(room_id) REFERENCES rooms(id))"
+                        "time_left INTEGER, my_current_role INTEGER, last_card_move INTEGER," \
+                        "current_trade_bet INTEGER, cards VARCHAR, stopped_trading INTEGER," \
+                        "my_tricks INTEGER," \
+                        "FOREIGN KEY(room_id) REFERENCES rooms(id))"
     rooms_table_sql = "CREATE TABLE if NOT EXISTS rooms (id INTEGER PRIMARY KEY ASC, " \
                       "name VARCHAR(40), password VARCHAR(40), whist_cost INTEGER, bullet INTEGER," \
                       "rasp_exit VARCHAR(10), rasp_progression VARCHAR(10), without_three INTEGER, " \
                       "no_whist_raspasy_exit INTEGER, player1 INTEGER, player2 INTEGER, player3 INTEGER," \
-                      " stalingrad INTEGER, ten_whist INTEGER," \
+                      " stalingrad INTEGER, ten_whist INTEGER, active_player INTEGER, game_state INTEGER," \
+                      " shuffler INTEGER, whisters_number INTEGER, current_trade_bet INTEGER, " \
+                      "passers_cards_are_sent INTEGER, current_suit INTEGER, current_trump INTEGER, " \
+                      "cards_on_table INTEGER, current_first_hand INTEGER, open_game INTEGER, trade_winner INTEGER," \
                       "game_type VARCHAR(20))"
+
+
+    create_test_room_sql = "INSERT INTO rooms (name, password, whist_cost, bullet, "  \
+                           "rasp_exit, rasp_progression, without_three, no_whist_raspasy_exit,"\
+                           "stalingrad, ten_whist, game_type) VALUES('test_room', null, 5, 10, '6 7 7',"\
+                           "'2 2 2', 1, 1, 1, 1, 'Leningrad')"
+
+    print('Creating tables if not exist...')
     with sqlite3.connect(DB_STRING) as con:
         con.execute(rooms_table_sql)
         con.execute(players_table_sql)
+        res = con.execute('SELECT * FROM rooms WHERE name = "test_room"')
+        if not res.fetchone():
+            con.execute(create_test_room_sql)
 
 
 if __name__ == '__main__':
@@ -334,7 +352,6 @@ if __name__ == '__main__':
         }
     }
 
-    id_to_regid = {}
     cherrypy.server.socket_host = '0.0.0.0'  # local computer, public available
     cherrypy.engine.subscribe('start', setup_database)
     cherrypy.quickstart(StringGeneratorWebService(), '/', conf)
